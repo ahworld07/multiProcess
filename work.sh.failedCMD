@@ -1,0 +1,6 @@
+sddf
+echo 3
+grep -h
+echo 1
+awk -h
+echo 2
