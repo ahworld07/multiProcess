@@ -3,21 +3,129 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"database/sql"
 	"fmt"
 	"github.com/ahworld07/gpool"
 	"github.com/akamensky/argparse"
+	_ "github.com/mattn/go-sqlite3"
 	"io"
 	"log"
-	"sync"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 )
 
-var Fail_cmd string
+type MySql struct {
+	Db	*sql.DB
+}
 
-func RunCommand(N int, command_line string, pool *gpool.Pool){
+
+
+func (sqObj *MySql)Crt_tb() {
+	// create table if not exists
+	sql_job_table := `
+	CREATE TABLE IF NOT EXISTS job(
+		Id INTEGER NOT NULL PRIMARY KEY,
+		subJob_num INTEGER UNIQUE NOT NULL,
+		command	TEXT,
+		Status TEXT
+	);
+	`
+	_, err := sqObj.Db.Exec(sql_job_table)
+	if err != nil {
+		panic(err)
+	}
+}
+
+type jobStatusType string
+
+// These are project or module type.
+const (
+	J_pending    jobStatusType = "Pending"
+	J_failed    jobStatusType = "Failed"
+	J_running  jobStatusType = "Running"
+	J_finished  jobStatusType = "Finished"
+)
+
+
+func CheckCount(rows *sql.Rows) (count int) {
+	count = 0
+	for rows.Next() {
+		count ++
+	}
+	if err := rows.Err(); err != nil {
+		panic(err)
+	}
+	return count
+}
+
+func Creat_tb(shell_path string, line_unit int)(dbObj *MySql) {
+	shellAbsName, _ := filepath.Abs(shell_path)
+	dbpath := shellAbsName + ".db"
+	conn, err := sql.Open("sqlite3", dbpath)
+	CheckErr(err)
+	dbObj = &MySql{Db: conn}
+	dbObj.Crt_tb()
+
+	tx, _ := dbObj.Db.Begin()
+	defer tx.Rollback()
+	insert_job, err := tx.Prepare("INSERT INTO job(subJob_num, command, Status) values(?,?,?)")
+	CheckErr(err)
+
+	f, err := os.Open(shellAbsName)
+	if err != nil {
+		panic(err)
+	}
+	buf := bufio.NewReader(f)
+
+	ii := 0
+	var cmd_l string = ""
+	N := 0
+	for {
+		line, err := buf.ReadString('\n')
+		if err != nil || err == io.EOF {
+			break
+		}
+
+		if ii == 0{
+			cmd_l = line
+			ii++
+		}else if ii < line_unit{
+			cmd_l = cmd_l + line
+			ii++
+		}else{
+			N++
+			Nrows, err := tx.Query("select Id from job where subJob_num = ?", N)
+			defer Nrows.Close()
+			CheckErr(err)
+			if CheckCount(Nrows)==0 {
+				_, _ = insert_job.Exec(N, cmd_l, J_pending)
+			}
+
+			ii = 1
+			cmd_l = line
+		}
+	}
+
+	if ii > 0{
+		N++
+		Nrows, err := tx.Query("select Id from job where subJob_num = ?", N)
+		defer Nrows.Close()
+		CheckErr(err)
+		if CheckCount(Nrows)==0 {
+			_, _ = insert_job.Exec(N, cmd_l, J_pending)
+		}
+	}
+
+	err = tx.Commit()
+	CheckErr(err)
+	return
+}
+
+func RunCommand(N int, command_line string, pool *gpool.Pool, update_job *sql.Stmt, tx *sql.Tx){
 	//command_line_l := strings.TrimSpace(command_line)
 	command_line_l := strings.TrimSuffix(command_line, "\n")
 	tmp := strings.Split(command_line_l, "\n")
@@ -45,6 +153,7 @@ func RunCommand(N int, command_line string, pool *gpool.Pool){
 
 	*/
 	//fmt.Println("aaaa",multi_cmd)
+
 	cmd := exec.Command("sh","-c",multi_cmd)
 	cmd.Stdout = &outbuf
 	cmd.Stderr = &errbuf
@@ -81,12 +190,17 @@ func RunCommand(N int, command_line string, pool *gpool.Pool){
 	//os.Stdout.WriteString(fmt.Sprintf("%v",exitCode))
 	//os.Stderr.WriteString(stderr)
 	//fmt.Println("exitCode", exitCode)
-	if exitCode != 0{
-		var lock sync.Mutex //互斥锁
-		lock.Lock()
-		Fail_cmd = Fail_cmd + command_line
-		lock.Unlock() //解锁
+	var lock sync.Mutex //互斥锁
+	lock.Lock()
+	if exitCode == 0{
+		update_job.Exec(N, J_finished)
+	}else{
+		update_job.Exec(N, J_failed)
 	}
+	lock.Unlock() //解锁
+
+	err = tx.Commit()
+	CheckErr(err)
 	pool.Done()
 }
 
@@ -94,9 +208,7 @@ var documents string = `辅助并发程序
                     Created by Yuan Zan(seqyuan@gmail.com)
                     Version 0.0.1 (20190314)
                     输入格式同qsub_sge的输入文件格式
-
-1) 错误退出的command会统一输出到infile+.failedCMD
-2) 子进程的标准错误流和标准输出流会由此程序统一输出`
+1) 子进程的标准错误流和标准输出流会由此程序统一输出`
 
 func CheckErr(err error) {
 	if err != nil {
@@ -115,53 +227,28 @@ func main() {
 		return
 	}
 
-	f, err := os.Open(*opt_i)
-	if err != nil {
-		panic(err)
-	}
-	buf := bufio.NewReader(f)
+	dbObj := Creat_tb(*opt_i, *opt_l)
+	tx, _ := dbObj.Db.Begin()
+	defer tx.Rollback()
 
-	ii := 0
-	var cmd_l string = ""
 	pool := gpool.New(*opt_p)
 
-	N := 0
+	rows, err := tx.Query("select subJob_num, command from job where Status=Pending or Status=Failed")
+	defer rows.Close()
+	var subJob_num int
+	var command string
+	update_job, _ := tx.Prepare("UPDATE job set Status = ? where subJob_num = ?")
 
-	for {
-		line, err := buf.ReadString('\n')
-		if err != nil || err == io.EOF {
-			break
-		}
-
-		if ii == 0{
-			cmd_l = line
-			ii++
-		}else if ii < *opt_l{
-			cmd_l = cmd_l + line
-			ii++
-		}else{
-			pool.Add(1)
-			N++
-			go RunCommand(N, cmd_l, pool)
-			ii = 1
-			cmd_l = line
-		}
-	}
-
-	if ii > 0{
-		N++
+	for rows.Next() {
+		err = rows.Scan(&subJob_num, &command)
+		CheckErr(err)
 		pool.Add(1)
-		go RunCommand(N, cmd_l, pool)
+		go RunCommand(subJob_num, command, pool, update_job, tx)
+		update_job.Exec(subJob_num, J_running)
+		err = tx.Commit()
+		CheckErr(err)
 	}
 
 	pool.Wait()
-	if Fail_cmd != "" {
-
-		outfile := *opt_i + ".failedCMD"
-		fileObj, err := os.OpenFile(outfile, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0777)
-		defer fileObj.Close()
-		CheckErr(err)
-		_, err = io.WriteString(fileObj, Fail_cmd)
-		os.Exit(1)
-	}
 }
+
