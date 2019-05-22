@@ -206,7 +206,7 @@ func RunCommand(N int, command_line string, pool *gpool.Pool, update_job *sql.St
 
 var documents string = `辅助并发程序
                     Created by Yuan Zan(seqyuan@gmail.com)
-                    Version 0.0.2 (20190522)
+                    Version 0.0.1 (20190314)
                     输入格式同qsub_sge的输入文件格式
 1) 子进程的标准错误流和标准输出流会由此程序统一输出`
 
