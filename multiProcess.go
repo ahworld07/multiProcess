@@ -16,13 +16,14 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
+
+	//"time"
 )
 
 type MySql struct {
 	Db	*sql.DB
 }
-
-
 
 func (sqObj *MySql)Crt_tb() {
 	// create table if not exists
@@ -31,7 +32,11 @@ func (sqObj *MySql)Crt_tb() {
 		Id INTEGER NOT NULL PRIMARY KEY,
 		subJob_num INTEGER UNIQUE NOT NULL,
 		command	TEXT,
-		Status TEXT
+		status	TEXT,
+		exitCode	integer,
+		retry	integer, 
+		starttime	datetime,
+		endtime	datetime 
 	);
 	`
 	_, err := sqObj.Db.Exec(sql_job_table)
@@ -39,6 +44,7 @@ func (sqObj *MySql)Crt_tb() {
 		panic(err)
 	}
 }
+
 
 type jobStatusType string
 
@@ -72,7 +78,7 @@ func Creat_tb(shell_path string, line_unit int)(dbObj *MySql) {
 
 	tx, _ := dbObj.Db.Begin()
 	defer tx.Rollback()
-	insert_job, err := tx.Prepare("INSERT INTO job(subJob_num, command, Status) values(?,?,?)")
+	insert_job, err := tx.Prepare("INSERT INTO job(subJob_num, command, status, retry) values(?,?,?,?)")
 	CheckErr(err)
 
 	f, err := os.Open(shellAbsName)
@@ -102,7 +108,8 @@ func Creat_tb(shell_path string, line_unit int)(dbObj *MySql) {
 			defer Nrows.Close()
 			CheckErr(err)
 			if CheckCount(Nrows)==0 {
-				_, _ = insert_job.Exec(N, cmd_l, J_pending)
+				cmd_l = strings.TrimRight(cmd_l, "\n")
+				_, _ = insert_job.Exec(N, cmd_l, J_pending, 0)
 			}
 
 			ii = 1
@@ -116,7 +123,7 @@ func Creat_tb(shell_path string, line_unit int)(dbObj *MySql) {
 		defer Nrows.Close()
 		CheckErr(err)
 		if CheckCount(Nrows)==0 {
-			_, _ = insert_job.Exec(N, cmd_l, J_pending)
+			_, _ = insert_job.Exec(N, cmd_l, J_pending, 0)
 		}
 	}
 
@@ -125,7 +132,66 @@ func Creat_tb(shell_path string, line_unit int)(dbObj *MySql) {
 	return
 }
 
-func RunCommand(N int, command_line string, pool *gpool.Pool, update_job *sql.Stmt, tx *sql.Tx){
+func IlterCommand(dbObj *MySql, shell_path string, line_unit int, thred int){
+	shellAbsName, _ := filepath.Abs(shell_path)
+	f, err := os.Open(shellAbsName)
+	if err != nil {
+		panic(err)
+	}
+	buf := bufio.NewReader(f)
+
+	ii := 0
+	var cmd_l string = ""
+	N := 0
+
+	pool := gpool.New(thred)
+
+	for {
+		line, err := buf.ReadString('\n')
+		if err != nil || err == io.EOF {
+			break
+		}
+
+		if ii == 0{
+			cmd_l = line
+			ii++
+		}else if ii < line_unit{
+			cmd_l = cmd_l + line
+			ii++
+		}else{
+			N++
+			cmd_l = strings.TrimRight(cmd_l, "\n")
+			pool.Add(1)
+			RunCommand(N, cmd_l, pool, dbObj)
+
+			ii = 1
+			cmd_l = line
+		}
+	}
+
+	if ii > 0{
+		N++
+		pool.Add(1)
+		cmd_l = strings.TrimRight(cmd_l, "\n")
+		RunCommand(N, cmd_l, pool, dbObj)
+	}
+
+	pool.Wait()
+}
+
+func RunCommand(N int, command_line string, pool *gpool.Pool, dbObj *MySql){
+	//tx, _ := dbObj.Db.Begin()
+	//defer tx.Rollback()
+	now := time.Now().Format("2006-01-02 15:04:05")
+	//q, err := dbObj.Db.Exec(fmt.Sprintf("UPDATE job set status=%s, starttime=%v where subJob_num=%v", "Running", now, subJob_num))
+	//update_job_start, _ := tx.Prepare("UPDATE job set Status = ?, starttime = ? where subJob_num = ?")
+	//update_job_end, _ := tx.Prepare("UPDATE job set Status = ?, endtime = ? where subJob_num = ?")
+	//update_job_start.Exec("Running", now, N)
+	//err := tx.Commit()
+	//_, err := dbObj.Db.Exec(fmt.Sprintf("UPDATE job set status=%s, starttime=%v where subJob_num=%v", J_running, now, N))
+	_, err := dbObj.Db.Exec("UPDATE job set status=?, starttime=? where subJob_num=?", J_running, now, N)
+
+	CheckErr(err)
 	//command_line_l := strings.TrimSpace(command_line)
 	command_line_l := strings.TrimSuffix(command_line, "\n")
 	tmp := strings.Split(command_line_l, "\n")
@@ -158,7 +224,7 @@ func RunCommand(N int, command_line string, pool *gpool.Pool, update_job *sql.St
 	cmd.Stdout = &outbuf
 	cmd.Stderr = &errbuf
 
-	err := cmd.Run()
+	err = cmd.Run()
 	stdout := outbuf.String()
 	stderr := errbuf.String()
 	var exitCode int
@@ -184,24 +250,48 @@ func RunCommand(N int, command_line string, pool *gpool.Pool, update_job *sql.St
 		exitCode = ws.ExitStatus()
 	}
 
-	os.Stdout.WriteString(fmt.Sprintf(">>>>line:%v\texitCode:%v>>>>\n%s\n", N, exitCode, stdout))
-	os.Stderr.WriteString(fmt.Sprintf(">>>>line:%v\texitCode:%v>>>>\n%s\n", N, exitCode, stderr))
+	os.Stdout.WriteString(fmt.Sprintf("<<<<line:%v\texitCode:%v>>>>\n%s\n", N, exitCode, stdout))
+	os.Stderr.WriteString(fmt.Sprintf("<<<<line:%v\texitCode:%v>>>>\n%s\n", N, exitCode, stderr))
 
 	//os.Stdout.WriteString(fmt.Sprintf("%v",exitCode))
 	//os.Stderr.WriteString(stderr)
 	//fmt.Println("exitCode", exitCode)
 	var lock sync.Mutex //互斥锁
 	lock.Lock()
+
+	now = time.Now().Format("2006-01-02 15:04:05")
 	if exitCode == 0{
-		update_job.Exec(N, J_finished)
+		//update_job_end.Exec(J_finished, now, N)
+		_, err = dbObj.Db.Exec("UPDATE job set status=?, starttime=?, exitCode=? where subJob_num=?", J_finished, now, exitCode, N)
+
 	}else{
-		update_job.Exec(N, J_failed)
+		_, err = dbObj.Db.Exec("UPDATE job set status=?, starttime=?, exitCode=? where subJob_num=?", J_failed, now, exitCode, N)
+
 	}
 	lock.Unlock() //解锁
 
-	err = tx.Commit()
+	//err = tx.Commit()
 	CheckErr(err)
 	pool.Done()
+}
+
+func CheckExitCode(dbObj *MySql){
+	tx, _ := dbObj.Db.Begin()
+	defer tx.Rollback()
+
+	rows, err := tx.Query("select exitCode from job")
+	CheckErr(err)
+	defer rows.Close()
+
+	exitCode := 0
+	for rows.Next() {
+		err := rows.Scan(&exitCode)
+		CheckErr(err)
+		if exitCode != 0{
+			break
+		}
+	}
+	os.Exit(exitCode)
 }
 
 var documents string = `辅助并发程序
@@ -216,11 +306,14 @@ func CheckErr(err error) {
 	}
 }
 
+
 func main() {
 	parser := argparse.NewParser("multiProcess", documents)
 	opt_i := parser.String("i", "infile", &argparse.Options{Required: true, Help: "Work.sh, same as qsub_sge's input format"})
 	opt_l := parser.Int("l", "line", &argparse.Options{Default: 1, Help: "Number of lines as a unit"})
 	opt_p := parser.Int("p", "thred", &argparse.Options{Default: 1, Help: "Thread process at same time"})
+	//opt_r := parser.Int("r", "retry", &argparse.Options{Default: 1, Help: "Max retry times"})
+
 	err := parser.Parse(os.Args)
 	if err != nil {
 		fmt.Print(parser.Usage(err))
@@ -228,27 +321,10 @@ func main() {
 	}
 
 	dbObj := Creat_tb(*opt_i, *opt_l)
-	tx, _ := dbObj.Db.Begin()
-	defer tx.Rollback()
 
-	pool := gpool.New(*opt_p)
+	IlterCommand(dbObj, *opt_i, *opt_l, *opt_p)
 
-	rows, err := tx.Query("select subJob_num, command from job where Status=Pending or Status=Failed")
-	defer rows.Close()
-	var subJob_num int
-	var command string
-	update_job, _ := tx.Prepare("UPDATE job set Status = ? where subJob_num = ?")
-
-	for rows.Next() {
-		err = rows.Scan(&subJob_num, &command)
-		CheckErr(err)
-		pool.Add(1)
-		go RunCommand(subJob_num, command, pool, update_job, tx)
-		update_job.Exec(subJob_num, J_running)
-		//err = tx.Commit()
-		//CheckErr(err)
-	}
-
-	pool.Wait()
+	CheckExitCode(dbObj)
 }
+
 
